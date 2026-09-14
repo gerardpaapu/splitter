@@ -1,288 +1,176 @@
 import * as FS from 'node:fs/promises';
 import {
-  stringify,
   stringifyBody,
-  stringifyHeadings,
+  stringifyHeadingIsh,
   stringifySegment,
   toInitialChunks,
 } from './markdown.ts';
 import * as SS from './similarity.ts';
 import { wordCount } from './word-count.ts';
-import type { Chunk } from './Chunk.ts';
+import type { Chunk, ChunkWithStats } from './Chunk.ts';
 
 const TARGET_SIZE = 500;
 const SIZE_FACTOR = 0.005;
 const SIMILARITY_FACTOR = 200;
-const BEAMS = 6;
-const SPLIT_HEADINGS_FACTOR = 70;
-const MAX_ITERATIONS = 20;
-const ERROR_THRESHOLD = 1;
-const STALE_TOLERANCE = 4;
-const DIVERSITY_PENALTY_FACTOR = 800;
-const WRITE_WINNER_TO_STDOUT = false;
+const SPLIT_HEADINGS_FACTOR = 280;
+const WRITE_WINNER_TO_STDOUT = true;
 
-interface Beam {
+interface Path {
   cuts: number[];
-  segments: Chunk[][];
   error: number;
-  penalty: number;
 }
 
-function calculatePenalty(beams: Beam[], idx: number) {
-  let total = 0;
-  for (let i = 0; i < idx; i++) {
-    let len = Math.min(beams[i]!.cuts.length, beams[idx]!.cuts.length);
-    for (let j = 0; j < len; j++) {
-      if (beams[i]!.cuts[j] === beams[idx]!.cuts[j]) {
-        total++;
-      }
+function howManyHeadingsDropped(previous: Chunk | undefined, current: Chunk) {
+  if (previous == undefined) {
+    return 0;
+  }
+
+  let matching = 0;
+  for (let i = 0; i < previous.headings.length; i++) {
+    let a = stringifyHeadingIsh(current.headings[i]!);
+    let b = stringifyHeadingIsh(previous.headings[i]!);
+
+    if (a !== b) {
+      matching = i;
+      break;
     }
   }
 
-  return total * DIVERSITY_PENALTY_FACTOR;
+  return previous.headings.length - matching;
 }
 
-function dedupeCuts(cutss: number[][]) {
-  const result = [] as number[][];
-  for (const cuts of cutss) {
-    if (result.every((c) => c.join(',') !== cuts.join(','))) {
-      result.push(cuts);
-    }
-  }
-
-  return result;
-}
-
-function addRandomBeams(beams: Beam[], chunks: Chunk[]) {
-  while (beams.length < BEAMS) {
-    let cuts = [];
-    let total = 0;
-
-    while (total < chunks.length) {
-      let size = Math.floor(Math.random() * (chunks.length - total)) + 1;
-      cuts.push(size);
-      total += size;
-    }
-
-    let segments = applyCuts(cuts, chunks);
-    let error = calculateError(segments);
-
-    beams.push({ cuts, segments, error, penalty: 0 });
-  }
-  beams.sort((a, b) => a.error - b.error);
-}
-
-async function main() {
-  const txt = await FS.readFile('button.md', 'utf8');
-  const chunks = toInitialChunks(txt);
+async function addFeatures(chunks: Chunk[]): Promise<ChunkWithStats[]> {
+  console.time('calculating embeddings');
 
   for (const chunk of chunks) {
     chunk.embedding = await SS.extract(stringifyBody(chunk));
   }
+  console.timeEnd('calculating embeddings');
 
-  let iterations = 0;
+  console.time('calculating similarities');
+  chunks[0]!.similarity_back = 0;
+  chunks[0]!.headings_dropped = 0;
 
-  let beams = [] as Beam[];
-  addRandomBeams(beams, chunks);
-  let { segments, cuts, error } = beams[0]!;
-  let previous = error;
-  let staleCount = 0;
+  chunks.at(-1)!.similarity_forward = 0;
 
-  while (++iterations < MAX_ITERATIONS && error > ERROR_THRESHOLD) {
-    beams = dedupeCuts(
-      beams.flatMap(({ cuts }) => {
-        return mutate(cuts, 2);
-      }),
-    ).map((mutant) => {
-      let candidate = applyCuts(mutant, chunks);
-      let error = calculateError(candidate);
-      return {
-        cuts: mutant,
-        segments: candidate,
-        error,
-        penalty: 0,
-      };
-    });
-    console.log(`evaluated ${beams.length} candidates`);
-    beams.sort((a, b) => a.error - b.error);
-    beams.forEach((beam, idx) => {
-      beam.penalty = calculatePenalty(beams, idx);
-    });
-    beams.sort((a, b) => a.error + a.penalty - (b.error + b.penalty));
-    beams = beams.slice(0, BEAMS);
-    error = beams[0]!.error;
+  for (let i = 1; i < chunks.length; i++) {
+    let previous = chunks[i - 1];
+    let current = chunks[i];
 
-    if (error === previous) {
-      console.log(`stale: ${++staleCount}`);
-    } else {
-      staleCount = 0;
-      previous = error;
-      console.log(
-        `error = ${error.toFixed(2).padStart(10)}, iterations = ${iterations}`,
-      );
-    }
+    let similarity = SS.similarity(
+      previous?.embedding?.data as number[],
+      current?.embedding?.data as number[],
+    );
 
-    if (staleCount >= STALE_TOLERANCE) {
-      console.log(collectErrors(beams[0]?.segments!));
-      console.log(`stale! trying some new randoms`);
-      staleCount = 0;
-      beams = beams.slice(0, Math.floor(BEAMS / 2));
-      addRandomBeams(beams, chunks);
+    previous!.similarity_forward = similarity;
+    current!.similarity_back = similarity;
+    current!.headings_dropped = howManyHeadingsDropped(previous, current!);
+  }
+  console.timeEnd('calculating similarities');
+  return chunks as ChunkWithStats[];
+}
+
+async function main() {
+  const txt = await FS.readFile('button.md', 'utf8');
+  const incompleteChunks = toInitialChunks(txt);
+  const chunks = await addFeatures(incompleteChunks);
+  console.log(`chunks.length = ${chunks.length}`);
+  console.time(`Searching...`);
+  // solutions[i] is the best path (0..i + 1)
+  const solutions = [
+    { cuts: [0, 1], error: calculateError(chunks, 0, 1) },
+  ] as Path[];
+
+  for (let depth = 1; depth <= chunks.length; depth++) {
+    let lowestError = Infinity;
+
+    for (let midpoint = 1; midpoint < depth; midpoint++) {
+      let m = solutions[midpoint - 1]!;
+      if (m == undefined) {
+        throw new Error(
+          `missing earlier solutions[${midpoint - 1}] while solving for 0..${midpoint}`,
+        );
+      }
+
+      let error = m.error + calculateError(chunks, midpoint, depth);
+      if (error < lowestError) {
+        lowestError = error;
+        solutions[depth - 1] = {
+          cuts: [...m.cuts, depth],
+          error,
+        };
+      }
     }
   }
+  console.timeEnd(`Searching...`);
+
+  console.log(solutions.at(chunks.length));
   if (WRITE_WINNER_TO_STDOUT) {
-    for (const segment of segments) {
-      console.log(stringifySegment(segment));
-      console.log('============================');
+    const { cuts } = solutions.at(-1)!;
+    for (let i = 1; i < cuts.length; i++) {
+      const start = cuts[i - 1];
+      const end = cuts[i];
+
+      const segment = chunks.slice(start, end);
+      process.stdout.write(
+        `\n\n#### (${start?.toString().padStart(2)}, ${end?.toString().padStart(2)}) #############\n\n`,
+      );
+
+      process.stdout.write(stringifySegment(segment));
     }
   }
-
-  console.log(collectErrors(segments));
-  console.log(
-    `error = ${error.toFixed(2).padStart(10)}, iterations = ${iterations}`,
-  );
 }
 
-function mutate(cuts: number[], n: number): number[][] {
-  let result = [cuts];
-  for (let i = 0; i < n; i++) {
-    result = result.flatMap(mutateOneStep);
-    result = dedupeCuts(result);
-  }
-  return result;
-}
-
-function mutateOneStep(cuts: number[]): number[][] {
-  let mutants = [cuts] as number[][];
-
-  // merge one section with the one after it;
-  for (let i = 0; i < cuts.length - 1; i++) {
-    let mutant = [] as number[];
-    for (let j = 0; j < cuts.length; j++) {
-      if (i === j) {
-        continue;
-      }
-
-      if (i + 1 === j) {
-        mutant.push(cuts[i]! + cuts[j]!);
-      } else {
-        mutant.push(cuts[j]!);
-      }
-    }
-
-    mutants.push(mutant);
-  }
-
-  // split one section
-  for (let i = 0; i < cuts.length - 1; i++) {
-    for (let y = 1; y < cuts[i]!; y++) {
-      let mutant = [] as number[];
-      for (let j = 0; j < cuts.length; j++) {
-        if (j === i) {
-          mutant.push(y);
-          mutant.push(cuts[i]! - y);
-          continue;
-        }
-
-        mutant.push(cuts[j]!);
-      }
-
-      mutants.push(mutant);
-    }
-  }
-
-  // grow one section and shrink the one before it
-  // shrink one section and grow the one before it
-  for (let i = 1; i < cuts.length; i++) {
-    const a = [] as number[];
-    const b = [] as number[];
-    for (let j = 0; j < cuts.length; j++) {
-      if (i === j) {
-        a.push(cuts[i]! - 1);
-        b.push(cuts[i]! + 1);
-        continue;
-      }
-
-      if (i - 1 === j) {
-        a.push(cuts[i - 1]! + 1);
-        b.push(cuts[i - 1]! - 1);
-        continue;
-      }
-
-      a.push(cuts[j]!);
-      b.push(cuts[j]!);
-    }
-    mutants.push(a);
-    mutants.push(b);
-  }
-
-  return mutants.filter((mutant) => mutant.every((cut) => cut > 0));
-}
-
-function applyCuts(cuts: number[], chunks: Chunk[]): Chunk[][] {
-  const candidate = [];
-  let idx = 0;
-  for (const cut of cuts) {
-    candidate.push(chunks.slice(idx, idx + cut));
-    idx += cut;
-  }
-
-  console.assert(idx === chunks.length, `${cuts} = ${chunks.length}`);
-  // candidate.push(chunks.slice(idx));
-  return candidate;
-}
-function collectErrors(segments: Chunk[][]) {
+function collectErrors(chunks: Chunk[], start: number, end: number) {
   let error = [];
+  if (start === end) {
+    error.push({
+      type: 'zero-length-forbidden',
+      raw: 1,
+      // we just forbid these
+      error: Infinity,
+    });
 
-  let sizeDiff = wordCount(stringifySegment(segments[0]!)) - TARGET_SIZE;
+    return error;
+  }
+
+  let segment = chunks.slice(start, end);
+  let first = segment[0]!;
+  let wc = wordCount(stringifySegment(segment));
+  let sizeDiff = wc - TARGET_SIZE;
   error.push({
     type: 'sizediff',
     raw: sizeDiff,
     error: sizeDiff * sizeDiff * SIZE_FACTOR,
   });
 
-  for (let i = 1; i < segments.length; i++) {
-    let previous = segments[i - 1]!;
-    let current = segments[i]!;
-    let sizeDiff = wordCount(stringifySegment(current)) - TARGET_SIZE;
-    error.push({
-      type: 'sizediff',
-      raw: sizeDiff,
-      error: sizeDiff * sizeDiff * SIZE_FACTOR,
-    });
+  // to avoid double counting, let's count the similarity with our
+  // first paragraph compared to the paragraph the previous chunk's
+  // last paragraph
+  let similarity = first.similarity_back ?? 0;
+  error.push({
+    type: 'similarity',
+    raw: similarity,
+    error: similarity * similarity * SIMILARITY_FACTOR,
+  });
 
-    if (current.length === 0 || previous.length === 0) {
-      continue;
-    }
+  // again, we're only evaluating the cut before this chunk
+  // (should this be squared)?
+  let headlinesScore = first.headings_dropped ?? 0;
+  error.push({
+    type: 'split-headings',
+    raw: headlinesScore,
+    error: headlinesScore * headlinesScore * SPLIT_HEADINGS_FACTOR,
+  });
 
-    let similarity = SS.similarity(
-      previous?.at(-1)?.embedding?.data as number[],
-      current[0]?.embedding?.data as number[],
-    );
-
-    error.push({
-      type: 'similarity',
-      raw: similarity,
-      error: similarity * similarity * SIMILARITY_FACTOR,
-    });
-
-    let prevHeadings = stringifyHeadings(previous.at(-1)!);
-    let curHeadings = stringifyHeadings(current[0]!);
-    let headlinesMatch = curHeadings.startsWith(prevHeadings)
-      ? SPLIT_HEADINGS_FACTOR
-      : 0;
-
-    error.push({
-      type: 'split-headings',
-      raw: headlinesMatch,
-      error: headlinesMatch,
-    });
-  }
   return error;
 }
 
-function calculateError(segments: Chunk[][]) {
-  return collectErrors(segments).reduce((total, { error }) => total + error, 0);
+function calculateError(chunks: Chunk[], start: number, end: number) {
+  return collectErrors(chunks, start, end).reduce(
+    (total, { error }) => total + error,
+    0,
+  );
 }
 
 main().catch((e) => {

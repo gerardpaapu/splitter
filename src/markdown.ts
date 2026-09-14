@@ -108,6 +108,12 @@ export function stringifyHeadings(chunk: Chunk) {
     });
 }
 
+export function stringifyHeadingIsh(node: PseudoHeading) {
+  return remark()
+    .use(remarkGfm)
+    .stringify({ type: 'root', children: [node] });
+}
+
 export function stringifySegment(segment: Chunk[]): string {
   if (segment.length === 0) {
     return '';

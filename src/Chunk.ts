@@ -7,8 +7,14 @@ export interface Chunk {
   node: Paragraph | null;
   figures: RootContent[];
   embedding?: Tensor;
-  // similarity_back?: number;
-  // similarity_forward?: number;
+  similarity_back?: number;
+  similarity_forward?: number;
   headings_dropped?: number;
-  // word_count?: number;
+}
+
+export interface ChunkWithStats extends Chunk {
+  embedding: Tensor;
+  similarity_back: number;
+  similarity_forward: number;
+  headings_dropped: number;
 }
