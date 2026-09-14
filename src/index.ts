@@ -12,7 +12,10 @@ import type { Chunk, ChunkWithStats } from './Chunk.ts';
 const TARGET_SIZE = 500;
 const SIZE_FACTOR = 0.005;
 const SIMILARITY_FACTOR = 200;
-const SPLIT_HEADINGS_FACTOR = 280;
+// TODO: I think I've got this factor weird
+// what are we saying, that we *WANT* to cut at the **most** dropped
+// headings or at the **fewest** retained headings
+const SPLIT_HEADINGS_FACTOR = -100;
 const WRITE_WINNER_TO_STDOUT = true;
 
 interface Path {
@@ -108,12 +111,12 @@ async function main() {
   if (WRITE_WINNER_TO_STDOUT) {
     const { cuts } = solutions.at(-1)!;
     for (let i = 1; i < cuts.length; i++) {
-      const start = cuts[i - 1];
-      const end = cuts[i];
+      const start = cuts[i - 1]!;
+      const end = cuts[i]!;
 
       const segment = chunks.slice(start, end);
       process.stdout.write(
-        `\n\n#### (${start?.toString().padStart(2)}, ${end?.toString().padStart(2)}) #############\n\n`,
+        `\n\n### ✂️ (${start}, ${end}) dropped headings = ${chunks[start]!.headings_dropped}, similarity = ${chunks[start]!.similarity_back}✂️ ###\n\n`,
       );
 
       process.stdout.write(stringifySegment(segment));
