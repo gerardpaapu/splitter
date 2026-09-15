@@ -9,72 +9,91 @@ import * as SS from './similarity.ts';
 import { wordCount } from './word-count.ts';
 import type { Chunk, ChunkWithStats } from './Chunk.ts';
 
-const TARGET_SIZE = 500;
-const SIZE_FACTOR = 0.005;
-const SIMILARITY_FACTOR = 200;
-// TODO: I think I've got this factor weird
-// what are we saying, that we *WANT* to cut at the **most** dropped
-// headings or at the **fewest** retained headings
-const SPLIT_HEADINGS_FACTOR = -100;
+const TARGET_WORD_COUNT = 500;
+
+const SIZE_FACTOR = 2.5;
+const SIMILARITY_FACTOR = 1;
+const SPLIT_HEADINGS_FACTOR = 9_000;
+
 const WRITE_WINNER_TO_STDOUT = true;
+const FILE_PATH = process.argv[2];
+
+if (!FILE_PATH) {
+  console.error(`Missing arg FILE_PATH`);
+  process.exitCode = 1;
+  throw new Error('oops!')
+}
 
 interface Path {
   cuts: number[];
   error: number;
 }
 
-function howManyHeadingsDropped(previous: Chunk | undefined, current: Chunk) {
+function howManyHeadingsDropped(previous: Chunk | undefined, current: Chunk): [number, number] {
   if (previous == undefined) {
-    return 0;
+    return [0, 0];
   }
 
   let matching = 0;
   for (let i = 0; i < previous.headings.length; i++) {
     let a = stringifyHeadingIsh(current.headings[i]!);
     let b = stringifyHeadingIsh(previous.headings[i]!);
-
     if (a !== b) {
-      matching = i;
       break;
     }
+
+    matching++
   }
 
-  return previous.headings.length - matching;
+  return [matching, previous.headings.length - matching];
 }
 
 async function addFeatures(chunks: Chunk[]): Promise<ChunkWithStats[]> {
   console.time('calculating embeddings');
 
   for (const chunk of chunks) {
-    chunk.embedding = await SS.extract(stringifyBody(chunk));
+    try {
+      chunk.embedding = await SS.extract(stringifyBody(chunk));
+    } catch (e) {
+      let text = stringifyBody(chunk);
+      console.error(e);
+      console.error(`embedding failed on (len = ${text.length})`);
+    }
   }
   console.timeEnd('calculating embeddings');
 
   console.time('calculating similarities');
   chunks[0]!.similarity_back = 0;
   chunks[0]!.headings_dropped = 0;
+  chunks[0]!.headings_retained = 0;
+
 
   chunks.at(-1)!.similarity_forward = 0;
-
   for (let i = 1; i < chunks.length; i++) {
     let previous = chunks[i - 1];
     let current = chunks[i];
-
-    let similarity = SS.similarity(
-      previous?.embedding?.data as number[],
-      current?.embedding?.data as number[],
+    let similarity: number | undefined;
+    
+    similarity = SS.similarity(
+      previous?.embedding!,
+      current?.embedding!,
     );
 
-    previous!.similarity_forward = similarity;
-    current!.similarity_back = similarity;
-    current!.headings_dropped = howManyHeadingsDropped(previous, current!);
+    previous!.similarity_forward = similarity ?? 0;
+    current!.similarity_back = similarity ?? 0;
+
+    const [retained, dropped] = howManyHeadingsDropped(previous, current!)
+    current!.headings_dropped = dropped;
+    current!.headings_retained = retained;
   }
   console.timeEnd('calculating similarities');
+
   return chunks as ChunkWithStats[];
 }
 
 async function main() {
-  const txt = await FS.readFile('button.md', 'utf8');
+  console.log(`FILE_PATH=${FILE_PATH}`)
+  const txt = await FS.readFile(FILE_PATH!, 'utf8');
   const incompleteChunks = toInitialChunks(txt);
   const chunks = await addFeatures(incompleteChunks);
   console.log(`chunks.length = ${chunks.length}`);
@@ -85,7 +104,10 @@ async function main() {
   ] as Path[];
 
   for (let depth = 1; depth <= chunks.length; depth++) {
-    let lowestError = Infinity;
+    solutions[depth - 1] = {
+      cuts: [0, depth],
+      error: calculateError(chunks, 0, depth)
+    }
 
     for (let midpoint = 1; midpoint < depth; midpoint++) {
       let m = solutions[midpoint - 1]!;
@@ -96,8 +118,7 @@ async function main() {
       }
 
       let error = m.error + calculateError(chunks, midpoint, depth);
-      if (error < lowestError) {
-        lowestError = error;
+      if (error < solutions[depth - 1]!.error) {
         solutions[depth - 1] = {
           cuts: [...m.cuts, depth],
           error,
@@ -105,9 +126,9 @@ async function main() {
       }
     }
   }
+
   console.timeEnd(`Searching...`);
 
-  console.log(solutions.at(chunks.length));
   if (WRITE_WINNER_TO_STDOUT) {
     const { cuts } = solutions.at(-1)!;
     for (let i = 1; i < cuts.length; i++) {
@@ -115,8 +136,11 @@ async function main() {
       const end = cuts[i]!;
 
       const segment = chunks.slice(start, end);
+      const errors = collectErrors(chunks, start, end);
+      const wc = wordCount(stringifySegment(segment));
+
       process.stdout.write(
-        `\n\n### ✂️ (${start}, ${end}) dropped headings = ${chunks[start]!.headings_dropped}, similarity = ${chunks[start]!.similarity_back}✂️ ###\n\n`,
+        `\n\n### ✂️ (${start}) wc = ${String(wc).padStart(7)} headings split = ${chunks[start]!.headings_retained}, similarity = ${chunks[start]!.similarity_back}✂️ ###\n\n`,
       );
 
       process.stdout.write(stringifySegment(segment));
@@ -124,7 +148,7 @@ async function main() {
   }
 }
 
-function collectErrors(chunks: Chunk[], start: number, end: number) {
+function collectErrors(chunks: ChunkWithStats[], start: number, end: number) {
   let error = [];
   if (start === end) {
     error.push({
@@ -140,7 +164,8 @@ function collectErrors(chunks: Chunk[], start: number, end: number) {
   let segment = chunks.slice(start, end);
   let first = segment[0]!;
   let wc = wordCount(stringifySegment(segment));
-  let sizeDiff = wc - TARGET_SIZE;
+  let sizeDiff = wc - TARGET_WORD_COUNT;
+  first.size_diff = sizeDiff;
   error.push({
     type: 'sizediff',
     raw: sizeDiff,
@@ -150,7 +175,7 @@ function collectErrors(chunks: Chunk[], start: number, end: number) {
   // to avoid double counting, let's count the similarity with our
   // first paragraph compared to the paragraph the previous chunk's
   // last paragraph
-  let similarity = first.similarity_back ?? 0;
+  let similarity = first.similarity_back;
   error.push({
     type: 'similarity',
     raw: similarity,
@@ -159,7 +184,7 @@ function collectErrors(chunks: Chunk[], start: number, end: number) {
 
   // again, we're only evaluating the cut before this chunk
   // (should this be squared)?
-  let headlinesScore = first.headings_dropped ?? 0;
+  let headlinesScore = first.headings_retained;
   error.push({
     type: 'split-headings',
     raw: headlinesScore,
@@ -169,11 +194,21 @@ function collectErrors(chunks: Chunk[], start: number, end: number) {
   return error;
 }
 
-function calculateError(chunks: Chunk[], start: number, end: number) {
-  return collectErrors(chunks, start, end).reduce(
+function calculateError(chunks: ChunkWithStats[], start: number, end: number) {
+  const error = collectErrors(chunks, start, end).reduce(
     (total, { error }) => total + error,
     0,
   );
+
+  if (isNaN(error)) {
+    throw new Error(`invalid error calculated`);
+  }
+
+  if (!isFinite(error)) {
+    throw new Error(`Infinite error = ${start}, ${end}`)
+  }
+
+  return error;
 }
 
 main().catch((e) => {

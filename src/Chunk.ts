@@ -6,15 +6,18 @@ export interface Chunk {
   headings: PseudoHeading[]; // all the headings this is under closest first
   node: Paragraph | null;
   figures: RootContent[];
-  embedding?: Tensor;
+  embedding?: Float32Array;
   similarity_back?: number;
   similarity_forward?: number;
   headings_dropped?: number;
+  headings_retained?: number;
+  size_diff?: number;
 }
 
 export interface ChunkWithStats extends Chunk {
-  embedding: Tensor;
+  embedding: Float32Array;
   similarity_back: number;
   similarity_forward: number;
   headings_dropped: number;
+  headings_retained: number;
 }
